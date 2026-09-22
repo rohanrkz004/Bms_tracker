@@ -230,7 +230,7 @@ def scrape():
                 show["status"] = statuses[show["time"]]
 
         browser.close()
-        result = sorted(unique.values(), key=lambda x: (x["movie"].lower(), x["time"], x["screen"]))
+        result = sorted(shows, key=lambda x: (x["movie"].lower(), x["time"], x["screen"]))
         if not result:
             raise RuntimeError("AMB page loaded but no movie showtimes were parsed; state will not be changed.")
         return result
