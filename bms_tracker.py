@@ -12,7 +12,7 @@ BMS_URL = f"https://in.bookmyshow.com/cinemas/hyderabad/amb-cinemas-gachibowli/b
 STATE_FILE = Path("amb_20260925_state.json")
 
 TIME_RE = re.compile(r"\b(?:0?[1-9]|1[0-2])[:.]\d{2}\s*(?:AM|PM)\b", re.I)
-META_RE = re.compile(r"^[A-Za-z][A-Za-z +&-]*,\s*(?:2D|3D|4DX|IMAX|MX4D|DOLBY CINEMA)(?:\s+\w+)*$", re.I)
+META_RE = re.compile(r"^[^,\n]{2,80},\s*(?:2D|3D|4DX|IMAX|MX4D|DOLBY CINEMA)(?:\s+[^,\n]{1,30})*$", re.I)
 RATING_RE = re.compile(r"\s*\((?:U|A|UA\d*\+?)\)\s*$", re.I)
 SCREEN_WORDS = ("SCREEN", "LASER", "DOLBY", "ATMOS", "BARCO", "HDR", "LUXE", "INFINITY", "PXL", "VIP", "IMAX", "4DX")
 
@@ -61,49 +61,80 @@ def status_from(el):
 
 
 def parse_rendered_text(body, source="BMS"):
-    """Parse the rendered/text representation into show records."""
+    """Parse BMS's rendered text without assuming a particular DOM layout."""
     lines = [clean(x) for x in body.splitlines() if clean(x)]
-    start = 0
+    noise = {
+        "AVAILABLE", "FAST FILLING", "SOLD OUT", "HOUSE FULL", "UNAVAILABLE",
+        "lan", "SUBTITLES LANGUAGE", "Select Price Range", "Select Show Timings",
+    }
+
+    # BMS can return the same visible information with slightly different
+    # line breaks. First locate every movie + language/format pair, then collect
+    # times until the next movie pair.
+    pairs = []
     for i, line in enumerate(lines):
-        if line == "SUBTITLES LANGUAGE":
-            start = i + 1
-            break
-    lines = lines[start:]
+        if META_RE.match(line):
+            # Find the nearest meaningful line above the metadata. It is the
+            # movie title in BMS's current rendered layout.
+            j = i - 1
+            while j >= 0 and (lines[j] in noise or TIME_RE.search(lines[j])):
+                j -= 1
+            if j >= 0:
+                movie = RATING_RE.sub("", lines[j]).strip()
+                if movie and movie.upper() not in {x.upper() for x in noise}:
+                    pairs.append((i, movie, line))
+
+    # Keep only real-looking movie pairs and de-duplicate them.
+    clean_pairs = []
+    seen_pairs = set()
+    for item in pairs:
+        sig = (item[1], item[2])
+        if sig not in seen_pairs:
+            seen_pairs.add(sig)
+            clean_pairs.append(item)
+
     shows = []
-    current_movie = ""
-    current_meta = ""
-    noise = {"AVAILABLE", "FAST FILLING", "SOLD OUT", "HOUSE FULL", "lan", "SUBTITLES LANGUAGE", "Select Price Range", "Select Show Timings"}
-    for i, line in enumerate(lines):
-        if line in noise:
-            continue
-        tm = norm_time(line)
-        if tm:
-            screen = ""
+    for pidx, (meta_i, movie, meta) in enumerate(clean_pairs):
+        end = clean_pairs[pidx + 1][0] if pidx + 1 < len(clean_pairs) else len(lines)
+        block = lines[meta_i + 1:end]
+
+        for i, line in enumerate(block):
+            tm = norm_time(line)
+            if not tm:
+                continue
+
+            screen = "Not shown"
             status = "AVAILABLE"
-            for nxt in lines[i + 1:i + 4]:
+            for nxt in block[i + 1:i + 6]:
                 if TIME_RE.search(nxt):
                     break
                 nu = nxt.upper()
-                if "SOLD OUT" in nu or "HOUSE FULL" in nu:
+                if "SOLD OUT" in nu or "HOUSE FULL" in nu or "UNAVAILABLE" in nu:
                     status = "SOLD OUT"
                 elif "FAST FILLING" in nu:
                     status = "FAST FILLING"
                 elif any(w in nu for w in SCREEN_WORDS):
                     screen = nxt
-            if current_movie:
-                shows.append({"movie": current_movie, "language_format": current_meta or "Not shown", "time": tm, "screen": screen or "Not shown", "status": status})
-            continue
-        if META_RE.match(line):
-            current_meta = line
-            continue
-        if i + 1 < len(lines) and META_RE.match(lines[i + 1]):
-            current_movie = RATING_RE.sub("", line).strip()
-            current_meta = lines[i + 1]
+
+            shows.append({
+                "movie": movie,
+                "language_format": meta,
+                "time": tm,
+                "screen": screen,
+                "status": status,
+            })
+
     unique = {}
     for s in shows:
         unique["|".join([s["movie"], s["language_format"], s["time"], s["screen"]])] = s
+
     result = sorted(unique.values(), key=lambda x: (x["movie"].lower(), x["time"], x["screen"]))
     print(f"[INFO] Parsed {len(result)} shows from {source}")
+    if not result:
+        print("[DEBUG] Metadata lines detected:", [x for x in lines if META_RE.match(x)][:20])
+        print("[DEBUG] First 100 rendered lines:")
+        for n, line in enumerate(lines[:100], 1):
+            print(f"[DEBUG] {n:03d}: {line}")
     return result
 
 def scrape_via_reader():
