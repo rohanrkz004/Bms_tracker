@@ -188,9 +188,12 @@ def scrape():
             print("[WARN] Direct BMS browser access was not reliable; trying Reader fallback.")
             return scrape_via_reader()
 
-        # Extract every compact DOM block that contains a time. Python then
-        # reconstructs movies from the rendered text order. This avoids relying
-        # on BMS's private API/Next.js JSON.
+        # Parse the stable rendered text first. BMS changes its DOM classes
+        # frequently, so the tracker intentionally does not depend on private
+        # CSS selectors for movie/showtime extraction.
+        shows = parse_rendered_text(body, "BMS")
+
+        # Extract compact DOM blocks only for explicit availability evidence.
         raw = page.evaluate("""() => {
           const timeRe = /\\b(?:0?[1-9]|1[0-2])[:.]\\d{2}\\s*(?:AM|PM)\\b/i;
           const out = [];
@@ -198,78 +201,20 @@ def scrape():
             const own = (el.innerText || '').replace(/\\s+/g, ' ').trim();
             if (!own || own.length > 180 || !timeRe.test(own)) continue;
             if ([...el.children].some(c => timeRe.test((c.innerText || '').trim()))) continue;
-            let n = el;
-            let context = '';
+            let n = el, context = '';
             for (let i=0; i<5 && n; i++, n=n.parentElement) {
               const t = (n.innerText || '').trim();
               if (t.length > 0 && t.length < 1200) context = t;
             }
-            out.push({
-              text: el.innerText || '',
-              context,
+            out.push({text: el.innerText || '', context,
               cls: typeof el.className === 'string' ? el.className : '',
               aria: el.getAttribute('aria-label') || '',
               title: el.getAttribute('title') || '',
-              disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true'
-            });
+              disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true'});
           }
           return out;
-        }""")
+        }"")
 
-        # The full body text is the most stable source for movie/language/screen
-        # grouping. Parse it sequentially.
-        lines = [clean(x) for x in body.splitlines() if clean(x)]
-        start = 0
-        for i, line in enumerate(lines):
-            if line == "SUBTITLES LANGUAGE":
-                start = i + 1
-                break
-        lines = lines[start:]
-
-        shows = []
-        current_movie = ""
-        current_meta = ""
-        pending_time = None
-
-        noise = {"AVAILABLE", "FAST FILLING", "lan", "SUBTITLES LANGUAGE", "Select Price Range", "Select Show Timings"}
-
-        for i, line in enumerate(lines):
-            if line in noise:
-                continue
-            tm = norm_time(line)
-            if tm:
-                pending_time = tm
-                # Screen is usually the next rendered line.
-                screen = ""
-                for nxt in lines[i + 1:i + 3]:
-                    if TIME_RE.search(nxt):
-                        break
-                    if any(w in nxt.upper() for w in SCREEN_WORDS):
-                        screen = nxt
-                        break
-
-                if current_movie:
-                    shows.append({
-                        "movie": current_movie,
-                        "language_format": current_meta or "Not shown",
-                        "time": tm,
-                        "screen": screen or "Not shown",
-                        "status": "AVAILABLE",
-                    })
-                continue
-
-            if META_RE.match(line):
-                current_meta = line
-                continue
-
-            # A movie title normally precedes a language/format line. Use that
-            # relationship instead of guessing from arbitrary page labels.
-            if i + 1 < len(lines) and META_RE.match(lines[i + 1]):
-                current_movie = RATING_RE.sub("", line).strip()
-                current_meta = lines[i + 1]
-
-        # Map DOM status evidence back to matching times. We only promote a
-        # status when BMS explicitly exposes it; no guessed SOLD OUT states.
         statuses = {}
         for item in raw:
             tm = norm_time(item.get("text", ""))
@@ -283,12 +228,6 @@ def scrape():
         for show in shows:
             if show["time"] in statuses:
                 show["status"] = statuses[show["time"]]
-
-        # Deduplicate exact records.
-        unique = {}
-        for s in shows:
-            key = "|".join([s["movie"], s["language_format"], s["time"], s["screen"]])
-            unique[key] = s
 
         browser.close()
         result = sorted(unique.values(), key=lambda x: (x["movie"].lower(), x["time"], x["screen"]))
