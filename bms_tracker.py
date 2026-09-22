@@ -213,7 +213,7 @@ def scrape():
               disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true'});
           }
           return out;
-        }"")
+        }""")
 
         statuses = {}
         for item in raw:
