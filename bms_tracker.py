@@ -60,6 +60,76 @@ def status_from(el):
     return "AVAILABLE"
 
 
+def parse_rendered_text(body, source="BMS"):
+    """Parse the rendered/text representation into show records."""
+    lines = [clean(x) for x in body.splitlines() if clean(x)]
+    start = 0
+    for i, line in enumerate(lines):
+        if line == "SUBTITLES LANGUAGE":
+            start = i + 1
+            break
+    lines = lines[start:]
+    shows = []
+    current_movie = ""
+    current_meta = ""
+    noise = {"AVAILABLE", "FAST FILLING", "SOLD OUT", "HOUSE FULL", "lan", "SUBTITLES LANGUAGE", "Select Price Range", "Select Show Timings"}
+    for i, line in enumerate(lines):
+        if line in noise:
+            continue
+        tm = norm_time(line)
+        if tm:
+            screen = ""
+            status = "AVAILABLE"
+            for nxt in lines[i + 1:i + 4]:
+                if TIME_RE.search(nxt):
+                    break
+                nu = nxt.upper()
+                if "SOLD OUT" in nu or "HOUSE FULL" in nu:
+                    status = "SOLD OUT"
+                elif "FAST FILLING" in nu:
+                    status = "FAST FILLING"
+                elif any(w in nu for w in SCREEN_WORDS):
+                    screen = nxt
+            if current_movie:
+                shows.append({"movie": current_movie, "language_format": current_meta or "Not shown", "time": tm, "screen": screen or "Not shown", "status": status})
+            continue
+        if META_RE.match(line):
+            current_meta = line
+            continue
+        if i + 1 < len(lines) and META_RE.match(lines[i + 1]):
+            current_movie = RATING_RE.sub("", line).strip()
+            current_meta = lines[i + 1]
+    unique = {}
+    for s in shows:
+        unique["|".join([s["movie"], s["language_format"], s["time"], s["screen"]])] = s
+    result = sorted(unique.values(), key=lambda x: (x["movie"].lower(), x["time"], x["screen"]))
+    print(f"[INFO] Parsed {len(result)} shows from {source}")
+    return result
+
+def scrape_via_reader():
+    """Fallback through Jina Reader when GitHub's datacenter IP is blocked by BMS."""
+    import urllib.request
+    urls = [
+        f"https://r.jina.ai/{BMS_URL}",
+        f"https://r.jina.ai/https://in.bookmyshow.com/cinemas/hyd/amb-cinemas-gachibowli/buytickets/AMBH/{TARGET_DATE}",
+    ]
+    last_error = None
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain,text/markdown,*/*"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            print(f"[INFO] Reader HTTP {resp.status}; text {len(body):,} chars")
+            if "AMB Cinemas" not in body or not TIME_RE.search(body):
+                raise RuntimeError("Reader returned no reliable AMB showtime data")
+            shows = parse_rendered_text(body, "Jina Reader")
+            if shows:
+                return shows
+            raise RuntimeError("Reader returned AMB text but no showtimes were parsed")
+        except Exception as exc:
+            last_error = exc
+            print(f"[WARN] Reader fallback failed: {exc}")
+    raise RuntimeError(f"BMS direct access and Reader fallback both failed: {last_error}")
 def scrape():
     with sync_playwright() as p:
         browser = p.firefox.launch(headless=True)
@@ -84,7 +154,8 @@ def scrape():
 
         if status != 200 or "AMB Cinemas" not in body or not TIME_RE.search(body):
             browser.close()
-            raise RuntimeError("BMS did not return a reliable AMB showtime page; state will not be changed.")
+            print("[WARN] Direct BMS browser access was not reliable; trying Reader fallback.")
+            return scrape_via_reader()
 
         # Extract every compact DOM block that contains a time. Python then
         # reconstructs movies from the rendered text order. This avoids relying
